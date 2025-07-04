@@ -1,0 +1,831 @@
+---
+title: "Project Assignment - AirBnb"
+author: "Group D - Zehao Gao, Antonio Arena, Duy Le"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(naniar)
+library(lubridate)
+library(forcats)
+library(e1071)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(fpp3)
+library(tidymodels) #might be few issue loading this library
+library(mltools)
+library(data.table)
+library(recipes)
+
+set.seed(123)
+
+# Setting up Keras and TensorFlow
+library(keras)
+library(tensorflow)
+tensorflow::set_random_seed(123)
+
+
+```
+
+# Data preprocessing
+```{r}
+calendar.gz <- read_csv("calendar.csv.gz")
+df <- calendar.gz %>%
+  mutate(date = as_date(date),
+         price = parse_number(price))
+df_clean <- df%>% 
+  group_by(date) %>% 
+  summarise(average_price= mean(price))
+df_clean$weekday <- weekdays(df_clean$date)
+```
+
+## Create time variables
+```{r}
+
+# Create a "weekend" indicator variable
+df_clean <- df_clean %>%
+  mutate(
+    Monday = ifelse(weekday == "Monday", 1, 0),
+    Tuesday = ifelse(weekday == "Tuesday", 1, 0),
+    Wednesday = ifelse(weekday == "Wednesday", 1, 0),
+    Thursday = ifelse(weekday == "Thursday", 1, 0),
+    Friday = ifelse(weekday == "Friday", 1, 0),
+    Saturday = ifelse(weekday == "Saturday", 1, 0),
+    Sunday = ifelse(weekday == "Sunday", 1, 0)
+  )
+df_clean$month <- months(df_clean$date)
+# Create a "Spring indicator variable
+df_clean$Spring <- ifelse(df_clean$month %in% c("September","October","November"), 1, 0)
+# Create a "Summer" indicator variable
+df_clean$Summer <- ifelse(df_clean$month %in% c("December","January","February"), 1, 0)
+# Create a "Autumn" indicator variable
+df_clean$Autumn <- ifelse(df_clean$month %in% c("March","April","May"), 1, 0)
+
+# Create a "Winter" indicator variable
+df_clean$Winter <- ifelse(df_clean$month %in% c("June","July","August"), 1, 0)
+
+# get rid of month and weekday variable
+df_clean<- df_clean %>% 
+  select(-c(month,weekday))
+
+# Create a "holiday" indicator variable 
+df_clean$holiday <- ifelse(df_clean$date %in%
+                             as.Date(c("2023-06-12","2023-11-07",
+                                       "2023-12-25","2024-01-01",
+                                       "2023-12-26","2024-01-26",
+                                       "2024-03-11","2024-06-10")), 1, 0)
+```
+
+## Split the data into train and test set
+```{r}
+
+# Determine the total number of rows in the data
+total_rows <- nrow(df_clean)
+
+# Set the number of days to keep for traning, the proportion is 7/10
+train_days <- 256
+
+# Create the training set with 256 days
+df_train <- df_clean[1:train_days, ]
+
+# Create the testing set with the remaining 110 days
+df_test <- df_clean[(train_days + 1):total_rows, ]
+
+df_clean %>%
+  as_tsibble() %>%
+  gg_season(period = "week") +
+  theme(legend.position = "none")
+
+```
+
+## Create dataset for forecasting 295 days to 2024-04-01
+```{r}
+df_clean <- df_clean %>% as.tibble()
+# Create a data frame for forecasting with future dates to 2024-04-01
+forecast_dates <- seq(as.Date("2024-06-11"), by = "days", length.out = 295) 
+forecast_data <- data.frame(
+  date = forecast_dates,
+  weekday = weekdays(forecast_dates), 
+  month = months(forecast_dates),     
+  holiday = rep(0, 295)                
+)
+
+forecast_data <- forecast_data %>%
+  mutate(
+    Monday = ifelse(weekday == "Monday", 1, 0),
+    Tuesday = ifelse(weekday == "Tuesday", 1, 0),
+    Wednesday = ifelse(weekday == "Wednesday", 1, 0),
+    Thursday = ifelse(weekday == "Thursday", 1, 0),
+    Friday = ifelse(weekday == "Friday", 1, 0),
+    Saturday = ifelse(weekday == "Saturday", 1, 0),
+    Sunday = ifelse(weekday == "Sunday", 1, 0)
+  )
+# Create a "Spring indicator variable
+forecast_data$Spring <- ifelse(forecast_data$month %in% c("September","October","November"), 1, 0)
+# Create a "Summer" indicator variable
+forecast_data$Summer <- ifelse(forecast_data$month %in% c("December","January","February"), 1, 0)
+# Create a "Autumn" indicator variable
+forecast_data$Autumn <- ifelse(forecast_data$month %in% c("March","April","May"), 1, 0)
+
+# Create a "Winter" indicator variable
+forecast_data$Winter <- ifelse(forecast_data$month %in% c("June","July","August"), 1, 0)
+
+# get rid of month and weekday variable
+forecast_data<- forecast_data %>% 
+  select(-c(month,weekday))
+
+forecast_data$holiday <- ifelse(forecast_data$date %in%
+                             as.Date(c("2024-11-05",
+                                       "2024-12-25","2024-12-26",
+                                       "2025-01-01","2025-01-26",
+                                       "2025-03-10")), 1, 0)
+```
+
+
+# Random Forest
+
+##Tune parameters: grid search on mtry
+```{r}
+# Create control function for training with 10 folds and keep 3 folds for training. search method is grid.
+control <- trainControl(method="repeatedcv", number=10, repeats=3, search="grid")
+# Define the hyper-parameter grid for mtry values to explore
+tunegrid <- expand.grid(.mtry=c(1:12))
+# Perform grid search on random forest model, metric is RMSE
+rf_gridsearch <- caret::train(average_price~. -date, 
+                       data=df_clean, 
+                       method="rf", 
+                       metric="RMSE", 
+                       tuneGrid=tunegrid, 
+                       trControl=control)
+print(rf_gridsearch)
+plot(rf_gridsearch)
+# best mtry is 3 with rmse of 41.52707
+best_mtry = 3
+
+```
+
+## Grid search on ntrees
+```{r}
+# Manual search by creat 10 folds and repeat 3 times
+control <- trainControl(method = 'repeatedcv',
+                        number = 10,
+                        repeats = 3,
+                        search = 'grid')
+# Keep mtry as 4
+tunegrid <- expand.grid(.mtry = 3)
+modellist <- list()
+
+#train with different ntree parameters
+for (ntree in seq(100,1500,100)){
+  set.seed(123)
+  fit <- caret::train(average_price~.-date,
+               data = df_clean,
+               method = 'rf',
+               metric = 'RMSE',
+               tuneGrid = tunegrid,
+               trControl = control,
+               ntree = ntree)
+  key <- toString(ntree)
+  modellist[[key]] <- fit
+}
+
+#Compare results
+results <- resamples(modellist)
+summary(results)
+#ntree = 1000 for lowest rmse of 41.49274
+best_ntree =1000
+# Create a graph that shows ntrees and rmse
+ntrees <- seq(100, 1500, by = 100)
+rmse <- c(41.57047, 41.52107, 41.49400, 41.51544, 41.51058, 41.52255, 41.51234, 41.49305, 41.50383, 41.49274, 41.49472, 41.49350, 41.49869, 41.50550, 41.51121)
+tree_rmse <- data.frame(ntrees, rmse)
+ggplot(tree_rmse, aes(x = ntrees, y = rmse)) +
+  geom_line(color = "#3498db") +
+  geom_point(color = "black") +
+  labs(title = "RMSE vs. ntrees",
+       x = "ntrees",
+       y = "RMSE (Root Mean Square Error)") +
+  theme_minimal()
+```
+
+
+## Create random forest model, train and check RMSE on test set
+```{r}
+# Define the Random Forest model
+rf_model <- randomForest(average_price ~ .-date, 
+                         data = df_train,
+                         mtry=best_mtry, 
+                         ntree=best_ntree,
+                         importance = TRUE)
+
+# Predict using the Random Forest model
+test_result_values <- predict(rf_model, newdata = df_test)
+
+test_dates <- seq(as.Date("2024-02-22"), by = "days", length.out = 110)
+test_result_df <- data.frame(
+  date = as.Date(test_dates),  
+  forecastedValue = test_result_values,
+  actualPrice = df_test$average_price
+)
+
+# show the prediction results together with actual value
+colors <- c("Actual" = "#3498db", "Prediction" = "purple")
+ggplot(data = test_result_df, aes(x = date)) +
+  geom_line(aes(y = actualPrice, color = "Actual"), linetype = "solid") +
+  geom_line(aes(y = forecastedValue, color = "Prediction"), linetype = 2) +
+  labs(title = "Prediction on test set of Average Price", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Actual" = "solid", "Prediction" = "dashed"))
+
+rmse <- sqrt(mean((df_test$average_price - test_result_values)^2))
+cat("Root Mean Squared Error (RMSE) on test set:", rmse, "\n")
+
+```
+
+
+## Make prediction about 295 days in the futrue which covers the summer period to 2024-04-01
+```{r}
+# use whole data set to fit the random forest mdel again
+rf_model <- randomForest(average_price ~ .-date, 
+                         data = df_clean,
+                         mtry=best_mtry, 
+                         ntree=best_ntree,
+                         importance = TRUE)
+# Predict using the Random Forest model
+forecasted_values <- predict(rf_model, newdata = forecast_data)
+
+# Combine forecasted values and dates into a data frame
+forecast_df <- data.frame(
+  date = as.Date(forecast_dates),  
+  forecastedValue = forecasted_values
+)
+# Plot the forecasted values
+colors <- c("Historical value" = "#3498db", "Forecast value" = "purple")
+ggplot() +
+  geom_line(data = df_clean, aes(x = date, y = average_price, color = "Historical value"), linetype = "solid") +
+  geom_line(data = forecast_df, aes(x = date, y = forecastedValue, color = "Forecast value"), linetype = "solid") +
+  labs(title = "Forecasted Average Price for next 295 days", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Historical value" = "solid", "Forecast value" = "solid"))
+
+```
+
+# DNN Model
+
+## Data preprocess and initial model building
+```{r}
+# Get data into correct form
+y_train <- df_train$average_price
+x_train <- normalize(as.matrix(df_train %>% select(-c(average_price, date))))
+
+# Initialise list
+model_list <- list()
+```
+
+
+```{r}
+n_epochs <- 100
+
+# Build model with Dropout
+model_list[["Basic"]]$model <- 
+  keras_model_sequential() %>%
+  layer_dense(units = 128, activation = "relu", input_shape = c(ncol(x_train)),
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 64, activation = "relu",
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1, activation = "linear",
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  compile(loss = "mean_squared_error", 
+          optimizer = optimizer_rmsprop(), 
+          metrics = c("mae")) 
+
+# Train the model
+model_list[["Basic"]]$fit <- model_list[["Basic"]]$model %>%
+  fit(x_train, 
+      y_train, 
+      epochs = n_epochs, 
+      batch_size = 16, 
+      validation_split = 0.2,
+       callbacks = callback_early_stopping(monitor = 'val_loss', 
+                                          patience = 2))
+```
+
+
+## Get RMSE and Plot from Test Set
+```{r}
+# Predict using the NN
+x_forecast <- as.matrix(df_test %>% select(-c(date, average_price)))
+
+# Predict using the Random Forest model
+test_result_values <- predict(model_list$Basic$model, x = normalize(x_forecast))
+
+test_dates <- seq(as.Date("2024-02-22"), by = "days", length.out = 110)
+
+
+test_result_df <- data.frame(
+  date = as.Date(test_dates),  
+  forecastedValue = test_result_values,
+  actualPrice = df_test$average_price
+)
+# show the prediction results together with actual value
+colors <- c("Actual" = "#3498db", "Prediction" = "purple")
+ggplot(data = test_result_df, aes(x = date)) +
+  geom_line(aes(y = actualPrice, color = "Actual"), linetype = "solid") +
+  geom_line(aes(y = forecastedValue, color = "Prediction"), linetype = 2) +
+  labs(title = "Prediction on test set of Average Price", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Actual" = "solid", "Prediction" = "dashed"))
+
+rmse <- sqrt(mean((df_test$average_price - test_result_values)^2))
+cat("Root Mean Squared Error (RMSE) on test set:", rmse, "\n")
+```
+
+
+## Make prediction about to 295 days to 2024-04-01
+```{r}
+# Predict using the NN
+x_forecast <- as.matrix(forecast_data %>% select(-c(date)))
+
+forecasted_values <- predict(model_list$Basic$model, x = normalize(x_forecast))
+
+
+# Combine forecasted values and dates into a data frame
+forecast_df <- data.frame(
+  date = as.Date(forecast_dates),  
+  forecastedValue = forecasted_values
+)
+# Plot the forecasted values
+colors <- c("Historical value" = "#3498db", "Forecast value" = "purple")
+ggplot() +
+  geom_line(data = df_clean, aes(x = date, y = average_price, color = "Historical value"), linetype = "solid") +
+  geom_line(data = forecast_df, aes(x = date, y = forecastedValue, color = "Forecast value"), linetype = "solid") +
+  labs(title = "Forecasted Average Price for next 295 days", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Historical value" = "solid", "Forecast value" = "solid"))
+
+```
+
+
+## Fit 'Improved' NN
+This model attempts to add more depth to the NN
+```{r}
+n_epochs <- 500
+
+
+# Build model with Dropout
+model_list[["Improved"]]$model <- 
+  keras_model_sequential() %>%
+  layer_normalization() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = c(ncol(x_train)),
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  layer_dense(units = 64, activation = "relu",
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  layer_dense(units = 1, activation = "linear",
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  compile(loss = "mean_squared_error", 
+          optimizer = optimizer_rmsprop(0.001), 
+          metrics = c("mae")) 
+
+# Train the model
+model_list[["Basic"]]$fit <- model_list[["Improved"]]$model %>%
+  fit(x_train, 
+      y_train, 
+      epochs = n_epochs, 
+      batch_size = 32, 
+      validation_split = 0.2,
+      callbacks = callback_early_stopping(monitor = 'val_loss', 
+                                          patience = 2))
+```
+
+
+## Get RMSE and Plot from Test Set
+```{r}
+# Predict using the NN
+x_forecast <- as.matrix(df_test %>% select(-c(date, average_price)))
+
+# Predict using the Random Forest model
+test_result_values <- predict(model_list$Improved$model, x = normalize(x_forecast))
+
+test_dates <- seq(as.Date("2023-05-27"), by = "days", length.out = 110)
+
+test_result_df <- data.frame(
+  date = as.Date(test_dates),  
+  forecastedValue = test_result_values,
+  actualPrice = df_test$average_price
+)
+# show the prediction results together with actual value
+colors <- c("Actual" = "#3498db", "Prediction" = "purple")
+ggplot(data = test_result_df, aes(x = date)) +
+  geom_line(aes(y = actualPrice, color = "Actual"), linetype = "solid") +
+  geom_line(aes(y = forecastedValue, color = "Prediction"), linetype = 2) +
+  labs(title = "Prediction on test set of Average Price", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Actual" = "solid", "Prediction" = "dashed"))
+
+rmse <- sqrt(mean((df_test$average_price - test_result_values)^2))
+cat("Root Mean Squared Error (RMSE) on test set:", rmse, "\n")
+```
+
+
+## Make prediction about 295 days in the future which covers the summer period
+```{r}
+# Predict using the NN
+x_forecast <- as.matrix(forecast_data %>% select(-c(date)))
+
+forecasted_values <- predict(model_list$Improved$model, x = normalize(x_forecast))
+
+
+# Combine forecasted values and dates into a data frame
+forecast_df <- data.frame(
+  date = as.Date(forecast_dates),  
+  forecastedValue = forecasted_values
+)
+# Plot the forecasted values
+colors <- c("Historical value" = "#3498db", "Forecast value" = "purple")
+ggplot() +
+  geom_line(data = df_clean, aes(x = date, y = average_price, color = "Historical value"), linetype = "solid") +
+  geom_line(data = forecast_df, aes(x = date, y = forecastedValue, color = "Forecast value"), linetype = "solid") +
+  labs(title = "Forecasted Average Price for next 295 days", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Historical value" = "solid", "Forecast value" = "solid"))
+
+```
+
+
+## Optimisation
+Perform a grid search on a single layer NN.
+Code is applied from ETC3555 Lab07.
+
+### Evaluate Splits
+```{r}
+n_epochs <- 2
+# Function to evaluate splits
+evaluate_split <- function(units, dropout_rate, split, ...) {
+  cat("Fitting: split = ", split$id[[1]], "; units = ", units, "; dropout = ", dropout_rate, "\n", sep = "")
+  
+  # Set seed
+  set.seed(123)
+  
+  # Clear session when function exits
+  on.exit(keras::backend()$clear_session())
+
+  # Define a single layer NN with dropout
+  model <- keras_model_sequential() %>%
+    layer_dense(units = units, activation = "relu", input_shape = c(ncol(x_train)),
+                kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+    layer_dropout(rate = dropout_rate) %>%
+    layer_dense(units = 1, activation = "linear",
+                kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+    compile(loss = "mean_squared_error",
+            optimizer = optimizer_rmsprop(),
+            metrics = c("mae"))
+  
+  # The data used for modeling (aka the "analysis" set)
+  # Note: need to convert back to matrices for keras
+  x_train_split <- analysis(split) %>%
+    select(starts_with("X")) %>%
+    as.matrix()
+  
+  y_train_split <- analysis(split) %>%
+    select(starts_with("Y")) %>%
+    as.matrix()
+
+  # Fit to training (analysis) set
+  fit(model, x = x_train_split, y = y_train_split, ...)
+  
+  # Now obtain the holdout set for evaluation
+  x_test_split <- assessment(split) %>%
+    select(starts_with("X")) %>%
+    as.matrix()
+  
+  y_test_split <- assessment(split) %>%
+    select(starts_with("Y")) %>%
+    as.matrix()
+  
+  # The results
+  results <- evaluate(model, x_test_split, y_test_split, verbose = 0)
+  results[1]
+}
+```
+
+
+### Grid Search
+```{r}
+# Function to perform a grid search
+across_grid <- function(split, grid_df, ...) {
+  # Execute grid for this resample
+  grid_df$loss <- pmap_dbl(
+    grid_df,
+    evaluate_split,
+    split = split,
+    ...  # Extra options for `fit`
+  )
+  # Assigns an split$id[[1]] to each row in the grid_df data frame
+  grid_df$id <- split$id[[1]]
+  
+  grid_df
+}
+
+# Convert matrices to dataframes for easier (and quicker) resampling. Need to be a bit fancy because y is a matrix of values (not just a single response).
+x_train_df <- as_data_frame(x_train)
+names(x_train_df) <- paste0("X", 1:ncol(x_train_df))
+y_train_df <- as_data_frame(y_train)
+names(y_train_df) <- paste0("Y", 1:ncol(y_train_df))
+cal_train <- dplyr::bind_cols(x_train_df, y_train_df)
+
+# 5-fold cross validation
+cv_splits <- rsample::vfold_cv(cal_train, v = 5)
+
+# Create grid
+grid_df <- list(units = c(16, 32, 64, 128),
+                dropout_rate = c(0, .25, .5, .75)) %>%
+  purrr::cross_df()
+
+# Fit model to each fold and hyperparameter combination
+if (file.exists("tune_results.RData")) {
+  load("tune_results.RData")
+} else {
+  tune_results <- purrr::map_df(
+    cv_splits$splits,
+    across_grid,
+    grid_df = grid_df,
+    batch_size = 128,
+    epochs = n_epochs,
+    verbose = 1,
+    view_metrics = 0
+  )
+  
+  save(tune_results, file = "tune_results.RData")
+}
+```
+
+
+### Plot heatmap funciton
+```{r}
+# Plot heatmap function
+plot_heatmap <- function(df) {
+  ggplot(df, aes(x = units, y = dropout_rate)) + 
+    geom_tile(aes(fill = loss)) +
+    geom_tile(aes(colour = optimal, size = optimal), fill = NA) +
+    geom_text(aes(label = round(loss, 2)), colour = "white") +
+    scale_x_log10(breaks = unique(grid_df$units)) +
+    scale_fill_gradient(high = "#132B43", low = "#56B1F7") +
+    scale_size_manual("optimal", values=c(0, 1)) + 
+    scale_colour_manual("optimal", values = c(NA, "darkorange1")) +
+    labs(title = "Grid search for optimal dropout rate and number of units",
+         subtitle = "Based on 5-fold cross validation")
+}
+```
+
+
+### Check average performance by plotting heatmap
+```{r}
+# Check average performance for units given in question
+tune_results %>% 
+  filter(units %in% c(16, 32, 64, 128)) %>% 
+  group_by(units, dropout_rate) %>% 
+  summarise(loss = mean(loss)) %>% 
+  ungroup() %>% 
+  mutate(optimal = loss == min(loss)) %>% 
+  plot_heatmap()
+```
+
+
+### Fit optimal model
+```{r}
+optimal_units = 128
+optimal_dropout = 0
+
+n_epochs = 500
+## RMSProp
+model_list[["RMSPROP"]]$model <- keras_model_sequential() %>%
+    layer_dense(units = optimal_units, activation = "relu", input_shape = c(ncol(x_train)),
+                kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+    layer_dropout(rate = optimal_dropout) %>%
+    layer_dense(units = 1, activation = "linear",
+                kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+    compile(loss = "mean_squared_error",
+            optimizer = optimizer_rmsprop(),
+            metrics = c("mae"))
+
+# Train the model
+model_list[["RMSPROP"]]$fit <- model_list[["RMSPROP"]]$model %>%
+  fit(x_train, y_train, epochs = n_epochs, batch_size = 128,
+      validation_split = 0.2)
+```
+
+
+
+# LSTM Model
+
+## Preprocessing the data for LSTM inputs
+Function to preprocess data for LSTM and after training unscaling + revert differencing was taken from:
+http://rwanjohi.rbind.io/2018/04/05/time-series-forecasting-using-lstm-in-r/
+
+
+```{r lstm-preproc-func}
+lag_transform <- function(x, k = 1){
+      lagged =  c(rep(NA, k), x[1:(length(x)-k)])
+      DF = as.data.frame(cbind(lagged, x))
+      colnames(DF) <- c( paste0('x-', k), 'x')
+      DF[is.na(DF)] <- 0
+      return(DF)
+}
+
+
+scale_data <- function(train, test, feature_range = c(0, 1)) {
+  x = train
+  fr_min = feature_range[1]
+  fr_max = feature_range[2]
+  std_train = ((x - min(x) ) / (max(x) - min(x)  ))
+  std_test  = ((test - min(x) ) / (max(x) - min(x)  ))
+  
+  scaled_train = std_train *(fr_max -fr_min) + fr_min
+  scaled_test = std_test *(fr_max -fr_min) + fr_min
+  
+  return( list(scaled_train = as.vector(scaled_train), scaled_test = as.vector(scaled_test) ,scaler= c(min =min(x), max = max(x))) )
+  
+}
+
+
+invert_scaling <- function(scaled, scaler, feature_range = c(0, 1)){
+  min = scaler[1]
+  max = scaler[2]
+  t = length(scaled)
+  mins = feature_range[1]
+  maxs = feature_range[2]
+  inverted_dfs = numeric(t)
+  
+  for( i in 1:t){
+    X = (scaled[i]- mins)/(maxs - mins)
+    rawValues = X *(max - min) + min
+    inverted_dfs[i] <- rawValues
+  }
+  return(inverted_dfs)
+}
+
+series <- df_clean$average_price
+series_diff <- difference(series, differences = 1, default = 0)
+df_lagged <- lag_transform(series_diff, 1)
+         
+
+train_days = 256
+total_rows <- nrow(df_lagged)
+# Create the training set with 256 days
+train <- df_lagged[1:train_days, ]
+
+# Create the testing set with the remaining 110 days
+test <- df_lagged[(train_days + 1):total_rows, ]
+
+scaled <- scale_data(train, test, c(-1,1))
+
+
+y_train <- as_vector(scaled$scaled_train[2])
+x_train <- as_vector(scaled$scaled_train[1])
+
+y_test <- as_vector(scaled$scaled_test[2])
+x_test <- as_vector(scaled$scaled_test[1])
+
+dim(x_train) <- c(length(x_train), 1, 1)
+
+X_shape2 = dim(x_train)[2]
+X_shape3 = dim(x_train)[3]
+batch_size = 1
+units = 30
+
+```
+
+## LSTM Model Training
+
+```{r lstm-modeling}
+
+lstm_model <- keras_model_sequential() %>%
+  layer_lstm(units, 
+       batch_input_shape = c(batch_size, X_shape2, X_shape3),
+       return_sequences = TRUE,
+       stateful = TRUE,
+       kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_lstm(units,
+        return_sequences = TRUE,
+        stateful = TRUE,
+        kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  layer_dropout(rate = 0.3) %>%
+  layer_dense(units = 1,
+              kernel_initializer=initializer_random_uniform(minval = -0.05, maxval = 0.05, seed = 123)) %>%
+  compile(loss = 'mean_squared_error',
+          optimizer = optimizer_adam(learning_rate = 0.02, weight_decay = 1e-6),
+          metrics = c('mae'))
+
+e = 50   
+for(i in 1:e ) {
+  lstm_model %>% fit(x_train, y_train, epochs=1, batch_size=batch_size, verbose=1, shuffle=FALSE)
+  lstm_model %>% reset_states()
+}
+
+L = length(x_test)
+scaler = scaled$scaler
+predictions = numeric(L)
+
+for(i in 1:L){
+     X = x_test[i]
+     dim(X) = c(1,1,1)
+     yhat = lstm_model %>% predict(X, batch_size = batch_size)
+     # invert scaling
+     yhat = invert_scaling(yhat, scaler,  c(-1, 1))
+     # invert differencing
+     yhat  = yhat + series[(train_days + i)]
+     # store
+     predictions[i] <- yhat
+}
+
+
+days <- seq(1, length(series))
+# Create a data frame with original data and LSTM predictions
+data_df <- data.frame(Date = df_clean$date, OriginalData = series, Prediction = c(rep(NA, train_days), predictions))
+
+# Create the plot 
+ggplot(data_df, aes(x = Date)) +
+  geom_line(aes(y = OriginalData), color = 'blue') +
+  geom_line(aes(y = Prediction), color = 'red') +
+  labs(x = 'Date', y = 'Average Price', title = 'LSTM Predictions vs. Original Data') +
+  scale_color_manual(values = c('Original Data' = 'blue', 'LSTM Predictions' = 'red')) +
+  theme_minimal()
+
+lstm_rmse <- sqrt(mean((df_test$average_price - predictions)^2))
+cat("Root Mean Squared Error (RMSE) on test set:", lstm_rmse, "\n")
+```
+
+## Forecast using LSTM
+
+```{r lstm-forecast}
+x_tr <- as_vector(scaled$scaled_train[1])
+x_te <- as_vector(scaled$scaled_test[1])
+new_x <- c(x_tr,x_te)
+
+L = nrow(forecast_data)
+scaler = scaled$scaler
+n_predictions = numeric(L)
+
+
+for(i in 1:L){
+     X = new_x[i]
+     dim(X) = c(1,1,1)
+     yhat = lstm_model %>% predict(X, batch_size = batch_size)
+     # invert scaling
+     yhat = invert_scaling(yhat, scaler,  c(-1, 1))
+     # invert differencing
+     yhat  = yhat + series[i+1]
+     # store
+     n_predictions[i] <- yhat
+}
+
+df_clean <- df_clean %>% as.tibble()
+# Create a data frame for forecasting with future dates to 2024-04-01
+forecast_dates <- seq(as.Date("2024-06-11"), by = "days", length.out = 295)
+forecast_data <- data.frame(
+  date = forecast_dates                
+)
+
+forecast_df <- data.frame(
+  date = as.Date(forecast_dates),  
+  forecastedValue = n_predictions
+)
+
+test_dates <- seq(as.Date("2024-02-22"), by = "days", length.out = 110)
+test_result_df <- data.frame(
+  date = as.Date(test_dates),  
+  forecastedValue = predictions,
+  actualPrice = df_test$average_price
+)
+
+# show the prediction results together with actual value
+colors <- c("Actual" = "#3498db", "Prediction" = "purple")
+ggplot(data = test_result_df, aes(x = date)) +
+  geom_line(aes(y = actualPrice, color = "Actual"), linetype = "solid") +
+  geom_line(aes(y = forecastedValue, color = "Prediction"), linetype = 2) +
+  labs(title = "Prediction on test set of Average Price", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Actual" = "solid", "Prediction" = "dashed"))
+
+
+# Plot the forecasted values
+colors <- c("Historical value" = "#3498db", "Forecast value" = "purple")
+ggplot() +
+  geom_line(data = df_clean, aes(x = date, y = average_price, color = "Historical value"), linetype = "solid") +
+  geom_line(data = forecast_df, aes(x = date, y = forecastedValue, color = "Forecast value"), linetype = "solid") +
+  labs(title = "Forecasted Average Price for next 295 days", x = "Date", y = "Average Price") +
+  scale_color_manual(name = "Legend", values = colors) +
+  scale_linetype_manual(name = "Legend", values = c("Historical value" = "solid", "Forecast value" = "solid"))
+
+```
+
+
+
+
+
+
